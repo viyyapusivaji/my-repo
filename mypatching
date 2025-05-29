@@ -1,0 +1,111 @@
+---
+- name: SUSE Linux patching with pre/post checks saved on Ansible control server
+  hosts: webserver
+  become: yes
+  gather_facts: yes
+
+  vars:
+    precheck_dir: /tmp/prechecks
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    precheck_file: "{{ precheck_dir }}/precheck_{{ inventory_hostname }}_{{ timestamp }}.log"
+    postcheck_file: "{{ precheck_dir }}/postcheck_{{ inventory_hostname }}_{{ timestamp }}.log"
+
+  tasks:
+
+    - name: Ensure precheck directory exists on control node
+      delegate_to: localhost
+      file:
+        path: "{{ precheck_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Run pre-check commands on remote host
+      shell: |
+        echo "===== Uptime ====="
+        uptime
+        echo ""
+        echo "===== Disk Usage (df -hT) ====="
+        df -hT
+        echo ""
+        echo "===== /etc/fstab ====="
+        cat /etc/fstab
+        echo ""
+        echo "===== Memory Info (free -gt) ====="
+        free -gt
+      register: precheck_output
+
+    - name: Save pre-check output on Ansible control server
+      delegate_to: localhost
+      copy:
+        content: "{{ precheck_output.stdout }}"
+        dest: "{{ precheck_file }}"
+        mode: '0644'
+
+    - name: Check if reboot is required
+      shell: |
+        if [ -f /var/run/reboot-required ]; then
+          echo "reboot-required"
+        elif command -v needs-restarting &>/dev/null; then
+          needs-restarting -r && echo "reboot-required" || echo "no-reboot"
+        else
+          echo "no-reboot"
+        fi
+      register: reboot_check
+      changed_when: false
+
+    - name: Fail patching if reboot required, exclude host and report
+      fail:
+        msg: "Reboot is required on the host {{ inventory_hostname }}. Skipping patching for safety."
+      when: reboot_check.stdout == "reboot-required"
+
+    - name: Check for available patches
+      shell: zypper lu
+      register: patch_check
+      changed_when: false
+      when: reboot_check.stdout != "reboot-required"
+
+    - name: Patch the system only if patches are available
+      shell: zypper patch -y
+      when:
+        - reboot_check.stdout != "reboot-required"
+        - patch_check.stdout | length > 0
+      register: patching_result
+      ignore_errors: yes
+
+    - name: Fail if patching failed and show error output
+      fail:
+        msg: |
+          Patching failed on host {{ inventory_hostname }}.
+          Error details:
+          {{ patching_result.stderr }}
+      when:
+        - reboot_check.stdout != "reboot-required"
+        - patch_check.stdout | length > 0
+        - patching_result is failed
+
+    - name: Inform no patches available and skipping patching
+      debug:
+        msg: "No patches available on {{ inventory_hostname }}, skipping patching."
+      when:
+        - reboot_check.stdout != "reboot-required"
+        - patch_check.stdout | length == 0
+
+    - name: Run post-check commands on remote host
+      shell: |
+        echo "===== Uptime ====="
+        uptime
+        echo ""
+        echo "===== Disk Usage (df -hT) ====="
+        df -hT
+        echo ""
+        echo "===== Memory Info (free -gt) ====="
+        free -gt
+      register: postcheck_output
+
+    - name: Save post-check output on Ansible control server
+      delegate_to: localhost
+      copy:
+        content: "{{ postcheck_output.stdout }}"
+        dest: "{{ postcheck_file }}"
+        mode: '0644'
+
